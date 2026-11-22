@@ -30,7 +30,45 @@ use std::time::{Duration, Instant};
 
 /// `const` = a value fixed at compile time. Names are SHOUTING_CASE by convention.
 const MAX_NAME: usize = 50; // max characters allowed for a UGC name
+const MAX_DESC: usize = 1000; // max characters allowed in a description
 const GITHUB_URL: &str = "https://github.com/eldezaki/Vollded";
+
+/// Everything the app is built with, shown in the About pop-up: (name, what it is used for).
+const COMPONENTS: [(&str, &str); 9] = [
+    (
+        "Rust (2021 edition)",
+        "Programming language and standard library",
+    ),
+    (
+        "eframe / egui 0.29",
+        "Window, rendering and the immediate-mode UI",
+    ),
+    (
+        "winit + glow (OpenGL)",
+        "Window events, drag & drop and graphics (via eframe)",
+    ),
+    (
+        "image 0.25",
+        "Decodes JPEG/PNG for the reference preview and app icon",
+    ),
+    ("rfd 0.15", "Native folder picker dialog"),
+    (
+        "open 5",
+        "Opens files, folders and links with the default app",
+    ),
+    (
+        "trash 5",
+        "Moves replaced and deleted files to the Recycle Bin",
+    ),
+    (
+        "serde + serde_json",
+        "Saves settings, statuses and notes as JSON",
+    ),
+    (
+        "winresource 0.1",
+        "Embeds the icon into the .exe at build time",
+    ),
+];
 
 // ───────────────────────── 2. Theme / styling ─────────────────────────
 // `Color32::from_rgb(r, g, b)` is a `const fn`, so colors can be constants too.
@@ -141,6 +179,10 @@ impl Status {
 struct Meta {
     status: Status,
     notes: String,
+    /// Link to the published UGC. Required to set the status to Uploaded.
+    /// `#[serde(default)]` = old save files without this field still load fine.
+    #[serde(default)]
+    link: String,
 }
 
 /// Everything we know about ONE UGC folder (e.g. folder "1"), filled in by `Item::load`.
@@ -474,6 +516,13 @@ struct Op {
     existing: Option<String>, // Some(name) if something already exists → needs confirmation
 }
 
+/// State of the "Set as Uploaded" pop-up.
+struct UploadDialog {
+    id: String,   // which UGC
+    link: String, // text typed so far
+    focus: bool,  // put the cursor in the box when it first opens
+}
+
 /// A drop that is waiting for the user to click "Replace" or "Cancel".
 struct Pending {
     id: String,
@@ -692,6 +741,32 @@ fn rename_inner_files(dir: &Path, old: &str, new: &str, problems: &mut Vec<Strin
     }
 }
 
+/// A published-UGC link must be a full http(s) URL with a real-looking host and no spaces.
+fn valid_link(s: &str) -> bool {
+    let s = s.trim();
+    if !(s.starts_with("https://") || s.starts_with("http://")) || s.contains(char::is_whitespace) {
+        return false;
+    }
+    // host = text between "://" and the next "/"
+    let rest = s.split("://").nth(1).unwrap_or("");
+    let host = rest.split('/').next().unwrap_or("");
+    host.contains('.') && host.len() > 3
+}
+
+/// Loads the window icon from assets/icon.png. `include_bytes!` bakes the file INTO the exe at
+/// compile time, so the exe stays a single portable file.
+fn load_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(include_bytes!("../assets/icon.png"))
+        .ok()?
+        .to_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
+
 /// Windows only: ask the OS where the mouse cursor is. We declare the one function we need
 /// ourselves, so no extra crate is required. (While dragging files from Explorer, Windows
 /// doesn't send mouse-move events to the app, so egui's own pointer position would be stale.)
@@ -773,10 +848,12 @@ struct App {
     thumb_tx: Sender<ThumbMsg>,
     thumb_rx: Receiver<ThumbMsg>,
     // Drag & drop
-    list_rect: Rect,                // where the left list was drawn last frame
-    main_rect: Rect,                // where the UGC view was drawn last frame
-    pending: Option<Pending>,       // drop waiting for confirmation
+    list_rect: Rect,                     // where the left list was drawn last frame
+    main_rect: Rect,                     // where the UGC view was drawn last frame
+    pending: Option<Pending>,            // drop waiting for confirmation
     pending_delete: Option<String>, // id of the UGC waiting for "move to Recycle Bin?" confirmation
+    upload_dialog: Option<UploadDialog>, // the "paste the published link" pop-up
+    show_about: bool,               // is the About pop-up open?
     drag_from: Option<usize>,       // index of the card being dragged to reorder
     last_frame: Instant,            // for the frame-rate limiter
     side_min_w: f32, // narrowest the left panel may get (measured on the first frame)
@@ -813,6 +890,8 @@ impl App {
             main_rect: Rect::NOTHING,
             pending: None,
             pending_delete: None,
+            upload_dialog: None,
+            show_about: false,
             drag_from: None,
             last_frame: Instant::now(),
             side_min_w: 0.0,
@@ -844,7 +923,7 @@ impl App {
         self.rename_buf = None;
         self.thumb = None;
         self.drag_from = None;
-        self.view_dirty = true;
+        self.rebuild_view(); // refresh the visible list right now (see `reload`)
         true
     }
 
@@ -860,6 +939,7 @@ impl App {
         let Some(root) = self.root.clone() else {
             return;
         };
+        let old_idx = self.selected;
         let keep = select.or_else(|| {
             self.selected
                 .and_then(|i| self.items.get(i))
@@ -867,10 +947,16 @@ impl App {
         });
         self.items = scan(&root);
         self.selected = keep.and_then(|k| self.items.iter().position(|i| i.id == k));
+        // The selected UGC is gone (moved or deleted outside the app)? Select its neighbour.
+        if self.selected.is_none() && !self.items.is_empty() {
+            self.selected = Some(old_idx.unwrap_or(0).min(self.items.len() - 1));
+        }
         self.thumb = None;
         self.rename_buf = None;
         self.drag_from = None;
-        self.view_dirty = true;
+        // Rebuild the visible list NOW: the list panel is drawn later in this same frame and
+        // must never see indices of folders that no longer exist.
+        self.rebuild_view();
     }
 
     /// Writes statuses + notes to `.ugc_manager.json`.
@@ -1073,6 +1159,122 @@ impl App {
         }
     }
 
+    // ── About pop-up ──
+    fn about_ui(&mut self, ctx: &egui::Context) {
+        let mut is_open = true; // the window's X button sets this to false
+        egui::Window::new("About")
+            .open(&mut is_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_width(430.0);
+                ui.label(RichText::new("Vollded UGC").size(24.0).strong().color(ACCENT));
+                // Version is read from Cargo.toml at compile time.
+                ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(MUTED));
+                ui.add_space(2.0);
+                ui.label("A portable manager for Vollded's Roblox UGC project folders: files, checklist, status and notes in one place.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label("Source code:");
+                    if link_text(ui, GITHUB_URL, 13.0).on_hover_text("Open on GitHub").clicked() {
+                        let _ = open::that(GITHUB_URL);
+                    }
+                });
+                ui.separator();
+                ui.label(RichText::new("Built with").strong());
+                egui::Grid::new("about_components").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
+                    for &(name, what) in COMPONENTS.iter() {
+                        ui.label(name);
+                        ui.label(RichText::new(what).size(12.5).color(MUTED));
+                        ui.end_row();
+                    }
+                });
+                ui.separator();
+                ui.label(
+                    RichText::new("Settings are stored in vollded_ugc.json next to the exe. Statuses and notes are stored in .ugc_manager.json inside the Vollded folder. Nothing is ever deleted permanently: replaced files and deleted UGCs go to the Recycle Bin.")
+                        .size(12.0)
+                        .color(MUTED),
+                );
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            is_open = false;
+        }
+        self.show_about = is_open;
+    }
+
+    // ── "Set as Uploaded" pop-up: a link to the published UGC is required ──
+    fn upload_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(d) = self.upload_dialog.as_mut() else {
+            return;
+        };
+        let mut decision: Option<bool> = None; // Some(true) = confirm, Some(false) = cancel
+        egui::Window::new("Set as Uploaded")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.label("Paste the link to the published UGC to mark it as Uploaded.");
+                ui.add_space(4.0);
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut d.link)
+                        .hint_text("https://www.roblox.com/catalog/…")
+                        .desired_width(440.0),
+                );
+                let valid = valid_link(&d.link);
+                // Green outline = valid link, red = not yet.
+                ui.painter().rect_stroke(
+                    r.rect.expand(2.0),
+                    6.0,
+                    Stroke::new(2.0, if valid { GOOD } else { ERR }),
+                );
+                if d.focus {
+                    r.request_focus();
+                    d.focus = false;
+                }
+                let enter =
+                    r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && valid;
+                let (hint, col) = if valid {
+                    ("Link looks good.", GOOD)
+                } else {
+                    ("Enter a full link starting with https://", ERR)
+                };
+                ui.label(RichText::new(hint).size(12.0).color(col));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(valid, egui::Button::new("Set as Uploaded").fill(ACCENT))
+                        .clicked()
+                        || enter
+                    {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            decision = Some(false);
+        }
+        let (id, link) = (d.id.clone(), d.link.trim().to_string());
+        match decision {
+            Some(true) => {
+                let m = self.meta.entry(id.clone()).or_default();
+                m.status = Status::Uploaded;
+                m.link = link;
+                self.upload_dialog = None;
+                self.view_dirty = true;
+                self.save_meta();
+                self.msg = format!("UGC {id} marked as Uploaded.");
+            }
+            Some(false) => self.upload_dialog = None,
+            None => {}
+        }
+    }
+
     // ── Delete a whole UGC (to the Recycle Bin) ──
 
     /// The "Delete this UGC?" pop-up.
@@ -1242,48 +1444,61 @@ impl App {
     }
 
     // ── Top bar ──
+    // Everything is laid out RIGHT-TO-LEFT in one row: stats (far right), Rescan, Browse, then the
+    // path box takes whatever width is left, and the title sits at the far left. That way the
+    // buttons and stats stay in the same place at every window width, even the smallest.
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let (total, done, up) = self.stats;
-        let w = ui.available_width();
-        let show_stats = w > 1000.0; // hide the stats text on narrow windows
-        let reserve = 140.0 + 210.0 + 40.0 + if show_stats { 330.0 } else { 0.0 };
-        let path_w = (w - reserve).clamp(100.0, 480.0);
+        // Exact width of the title, measured with the real font.
+        let title_w = ui.fonts(|f| {
+            f.layout_no_wrap(
+                "Vollded UGC".to_owned(),
+                FontId::proportional(20.0),
+                Color32::WHITE,
+            )
+            .size()
+            .x
+        });
 
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Vollded UGC")
-                    .size(20.0)
-                    .strong()
-                    .color(ACCENT),
-            );
-            ui.add_space(8.0);
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.root_input)
-                    .hint_text("Path to Vollded folder…")
-                    .desired_width(path_w),
-            );
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.open_root(PathBuf::from(self.root_input.trim()));
-            }
-            if ui.button("Browse").clicked() {
-                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                    self.open_root(p);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // Added first = ends up at the far right.
+                ui.label(RichText::new(format!("{up} uploaded")).color(ACCENT));
+                ui.label(RichText::new("·").color(MUTED));
+                ui.label(RichText::new(format!("{done}/{total} complete")).color(GOOD));
+                ui.label(RichText::new("·").color(MUTED));
+                ui.label(RichText::new(format!("{total} items")).color(MUTED));
+                ui.add_space(8.0);
+
+                if ui.button("Rescan").clicked() {
+                    self.reload(None);
+                    self.msg = "Rescanned folders.".into();
                 }
-            }
-            if ui.button("Rescan").clicked() {
-                self.reload(None);
-                self.msg = "Rescanned folders.".into();
-            }
-            if show_stats {
-                // Right-to-left layout: the first thing added ends up at the far right.
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("{up} uploaded")).color(ACCENT));
-                    ui.label(RichText::new("·").color(MUTED));
-                    ui.label(RichText::new(format!("{done}/{total} complete")).color(GOOD));
-                    ui.label(RichText::new("·").color(MUTED));
-                    ui.label(RichText::new(format!("{total} items")).color(MUTED));
-                });
-            }
+                if ui.button("Browse").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        self.open_root(p);
+                    }
+                }
+
+                // The path box fills all the space that is left (minus the title).
+                let path_w = (ui.available_width() - title_w - 24.0).max(80.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.root_input)
+                        .hint_text("Path to Vollded folder…")
+                        .desired_width(path_w),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.open_root(PathBuf::from(self.root_input.trim()));
+                }
+
+                // Added last = leftmost.
+                ui.label(
+                    RichText::new("Vollded UGC")
+                        .size(20.0)
+                        .strong()
+                        .color(ACCENT),
+                );
+            });
         });
     }
 
@@ -1318,7 +1533,11 @@ impl App {
         let n = self.visible.len();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, 70.0, n, |ui, range| {
             for row in range {
-                let i = self.visible[row]; // index into self.items
+                // `.get()` instead of `[ ]`: returns None instead of crashing if the list is out of date.
+                let Some(&i) = self.visible.get(row) else { continue };
+                if i >= self.items.len() {
+                    continue;
+                }
                 // The card reacts to clicks (select) AND drags (reorder).
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), 70.0), Sense::click_and_drag());
@@ -1462,7 +1681,9 @@ impl App {
         // at once as long as they point at DIFFERENT fields.
         let thumb = self.thumb.as_ref();
         let item = &mut self.items[idx];
-        let meta = self.meta.entry(item.id.clone()).or_default();
+        // Copy the id now: `item` must not be used after `self.save_meta()` below (that call borrows all of `self`).
+        let item_id = item.id.clone();
+        let meta = self.meta.entry(item_id.clone()).or_default();
         let rename_buf = &mut self.rename_buf;
         let rename_focus = &mut self.rename_focus;
         // Instead of changing `self` while we're still drawing, UI code records what the
@@ -1538,6 +1759,18 @@ impl App {
                         if ui.button("Open folder").clicked() {
                             act.to_open = Some(item.dir.clone());
                         }
+                        // Link to the published UGC (only for UGCs set to Uploaded).
+                        if meta.status == Status::Uploaded && !meta.link.is_empty() {
+                            if ui
+                                .add(
+                                    egui::Button::new("Open published UGC")
+                                        .fill(ACCENT.gamma_multiply(0.6)),
+                                )
+                                .clicked()
+                            {
+                                act.open_url = Some(meta.link.clone());
+                            }
+                        }
                     });
                 }
 
@@ -1557,23 +1790,23 @@ impl App {
                         let b = egui::Button::new(RichText::new(s.label()).color(txt_col))
                             .fill(if sel { s.color() } else { CARD_HOVER })
                             .rounding(20.0);
-                        if ui.add(b).clicked() && !sel {
-                            meta.status = s;
-                            act.status_changed = true;
+                        if ui.add(b).clicked() {
+                            if s == Status::Uploaded {
+                                // Uploaded needs a link: open the pop-up (prefilled with the old link).
+                                act.ask_uploaded = Some(meta.link.clone());
+                            } else if !sel {
+                                meta.status = s;
+                                act.status_changed = true;
+                            }
                         }
                     }
                 });
 
-                // ── Body: 2 columns when wide, 1 column when narrow ──
-                if ui.available_width() > 820.0 {
-                    ui.columns(2, |cols| {
-                        left_col(&mut cols[0], item, meta, &mut act, thumb);
-                        right_col(&mut cols[1], item, &mut act);
-                    });
-                } else {
-                    right_col(ui, item, &mut act);
-                    left_col(ui, item, meta, &mut act, thumb);
-                }
+                // ── Body: always 2 columns (the cards just get narrower in a small window) ──
+                ui.columns(2, |cols| {
+                    left_col(&mut cols[0], item, meta, &mut act, thumb);
+                    right_col(&mut cols[1], item, &mut act);
+                });
             });
 
         // ── Now carry out whatever the user asked for while we were drawing ──
@@ -1613,6 +1846,18 @@ impl App {
                 self.msg = format!("Could not open {}: {e}", d.display());
             }
         }
+        if let Some(link) = act.ask_uploaded.take() {
+            self.upload_dialog = Some(UploadDialog {
+                id: item_id,
+                link,
+                focus: true,
+            });
+        }
+        if let Some(u) = act.open_url {
+            if let Err(e) = open::that(&u) {
+                self.msg = format!("Could not open the link: {e}");
+            }
+        }
         if let Some(p) = act.to_open {
             if let Err(e) = open::that(&p) {
                 self.msg = format!("Could not open {}: {e}", p.display());
@@ -1632,6 +1877,8 @@ struct Actions {
     status_changed: bool,
     notes_edited: bool,
     rename: Option<String>,
+    ask_uploaded: Option<String>, // open the "Set as Uploaded" pop-up, prefilled with this link
+    open_url: Option<String>,     // open this link in the browser
 }
 
 /// A rounded "card" container with a plain title. `body` is a closure (an inline function)
@@ -1649,7 +1896,7 @@ fn card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
-/// Like `card`, but the title is clickable and has a folder icon. Returns true if clicked.
+/// Like `card`, but the title is clickable and ends with a white ">" arrow. Returns true if clicked.
 fn card_link(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) -> bool {
     let mut clicked = false;
     egui::Frame::none()
@@ -1658,31 +1905,22 @@ fn card_link(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) -
         .inner_margin(14.0)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            // A LayoutJob lets us mix colors in one label: white title + red folder icon.
-            let mut job = egui::text::LayoutJob::default();
-            let font = FontId::proportional(15.0);
-            job.append(
-                title,
-                0.0,
-                egui::TextFormat {
-                    font_id: font.clone(),
-                    color: TEXT,
-                    ..Default::default()
-                },
-            );
-            job.append(
-                "  📂",
-                0.0,
-                egui::TextFormat {
-                    font_id: font,
-                    color: ACCENT,
-                    ..Default::default()
-                },
-            );
-            let r = ui
-                .add(egui::Label::new(job).sense(Sense::click()))
+            // Lay the title text out first so we know how wide the clickable area must be.
+            let galley =
+                ui.painter()
+                    .layout_no_wrap(title.to_owned(), FontId::proportional(15.0), TEXT);
+            let size = Vec2::new(galley.size().x + 24.0, galley.size().y.max(18.0));
+            let (rect, r) = ui.allocate_exact_size(size, Sense::click());
+            let r = r
                 .on_hover_cursor(CursorIcon::PointingHand) // hand cursor = "this is a link"
                 .on_hover_text("Open this folder");
+            let p = ui.painter();
+            p.galley(rect.min, galley, TEXT);
+            // The arrow ">" drawn as two lines.
+            let c = egui::pos2(rect.max.x - 7.0, rect.center().y);
+            let st = Stroke::new(1.8, Color32::WHITE);
+            p.line_segment([c + Vec2::new(-3.0, -5.0), c + Vec2::new(2.0, 0.0)], st);
+            p.line_segment([c + Vec2::new(2.0, 0.0), c + Vec2::new(-3.0, 5.0)], st);
             if r.clicked() {
                 clicked = true;
             }
@@ -1793,6 +2031,43 @@ fn github_button(ui: &mut egui::Ui) -> egui::Response {
         .on_hover_text("Open the Vollded page on GitHub")
 }
 
+/// Small round "i" button (drawn with the painter, no icon font needed).
+fn info_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+    let col = if resp.hovered() { ACCENT } else { MUTED };
+    let p = ui.painter();
+    let c = rect.center();
+    p.circle_stroke(c, 8.5, Stroke::new(1.3, col)); // ring
+    p.circle_filled(c + Vec2::new(0.0, -3.8), 1.2, col); // dot of the "i"
+    p.line_segment(
+        [c + Vec2::new(0.0, -1.0), c + Vec2::new(0.0, 4.6)],
+        Stroke::new(1.7, col),
+    ); // stem
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("About Vollded UGC")
+}
+
+/// Small clickable text (turns red + underlined on hover). Returns the click response.
+fn link_text(ui: &mut egui::Ui, text: &str, size: f32) -> egui::Response {
+    // Color32::PLACEHOLDER = "use the color I pass to `galley()` later", so hover can change it.
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        FontId::proportional(size),
+        Color32::PLACEHOLDER,
+    );
+    let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
+    let col = if resp.hovered() { ACCENT } else { MUTED };
+    let p = ui.painter();
+    p.galley(rect.min, galley, col);
+    if resp.hovered() {
+        p.line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            Stroke::new(1.0, col),
+        );
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 /// Draws a little trash-can icon centered on `c` (no icon font needed).
 fn draw_trash(p: &egui::Painter, c: egui::Pos2, col: Color32) {
     let s = Stroke::new(1.4, col);
@@ -1871,20 +2146,45 @@ fn left_col(
             if r.changed() {
                 item.dirty = true;
             }
+            let count = item.description.chars().count();
+            let over = count > MAX_DESC;
+            // Outline: red when too long, green while editing a valid text (hidden otherwise).
+            if over || item.dirty || r.has_focus() {
+                ui.painter().rect_stroke(
+                    r.rect.expand(2.0),
+                    6.0,
+                    Stroke::new(2.0, if over { ERR } else { GOOD }),
+                );
+            }
             ui.horizontal_wrapped(|ui| {
-                let b = egui::Button::new("Save to .txt").fill(if item.dirty {
+                let can_save = item.dirty && !over;
+                let b = egui::Button::new("Save to .txt").fill(if can_save {
                     ACCENT
                 } else {
                     CARD_HOVER
                 });
-                if ui.add_enabled(item.dirty, b).clicked() {
+                if ui.add_enabled(can_save, b).clicked() {
                     act.save_desc = true;
                 }
+                let col = if over {
+                    ERR
+                } else if item.dirty {
+                    GOOD
+                } else {
+                    MUTED
+                };
                 ui.label(
-                    RichText::new(format!("{} chars", item.description.chars().count()))
+                    RichText::new(format!("{count}/{MAX_DESC}"))
                         .size(12.0)
-                        .color(MUTED),
+                        .color(col),
                 );
+                if over {
+                    ui.label(
+                        RichText::new("Too long: shorten it to save")
+                            .size(12.0)
+                            .color(ERR),
+                    );
+                }
             });
         }
     });
@@ -1947,7 +2247,7 @@ fn right_col(ui: &mut egui::Ui, item: &Item, act: &mut Actions) {
         progress_bar(ui, prog, &format!("{:.0}% complete", prog * 100.0));
     });
 
-    // ── Previews: the card title is a link to the previews folder ──
+    // ── Previews: the card title is a link (with a > arrow) to the previews folder ──
     let title = format!("Previews ({})", item.previews.len());
     let clicked = card_link(ui, &title, |ui| {
         if item.previews.is_empty() {
@@ -1955,12 +2255,15 @@ fn right_col(ui: &mut egui::Ui, item: &Item, act: &mut Actions) {
         }
         for p in &item.previews {
             ui.horizontal(|ui| {
-                if ui.button("▶").clicked() {
-                    act.to_open = Some(p.clone());
-                }
-                let name_w = (ui.available_width() - 75.0).max(40.0);
+                // Name on the left (cut off with "…" if needed); size + play button on the right.
+                let name_w = (ui.available_width() - 112.0).max(30.0);
                 trunc_label(ui, &fname(p), name_w);
-                ui.label(RichText::new(item.size(p)).size(12.0).color(MUTED));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("▶").clicked() {
+                        act.to_open = Some(p.clone());
+                    }
+                    ui.label(RichText::new(item.size(p)).size(12.0).color(MUTED));
+                });
             });
         }
     });
@@ -1968,26 +2271,22 @@ fn right_col(ui: &mut egui::Ui, item: &Item, act: &mut Actions) {
         act.open_dir = Some(item.dir.join("previews"));
     }
 
-    // ── Textures: title is a link; every file has its own Open button ──
+    // ── Textures: same idea. Every file is listed in full (no inner scroll box). ──
     let title = format!("Textures ({})", item.textures.len());
     let clicked = card_link(ui, &title, |ui| {
         if item.textures.is_empty() {
             empty_hint(ui, "No textures yet (drop .png files here)");
-        } else {
-            egui::ScrollArea::vertical()
-                .max_height(200.0)
-                .id_salt("tex")
-                .show(ui, |ui| {
-                    for p in &item.textures {
-                        ui.horizontal(|ui| {
-                            if ui.small_button("Open").clicked() {
-                                act.to_open = Some(p.clone());
-                            }
-                            let name_w = (ui.available_width() - 8.0).max(40.0);
-                            trunc_label(ui, &fname(p), name_w);
-                        });
+        }
+        for p in &item.textures {
+            ui.horizontal(|ui| {
+                let name_w = (ui.available_width() - 72.0).max(30.0);
+                trunc_label(ui, &fname(p), name_w);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Open").clicked() {
+                        act.to_open = Some(p.clone());
                     }
                 });
+            });
         }
     });
     if clicked {
@@ -2035,7 +2334,11 @@ impl eframe::App for App {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        if !dropped.is_empty() && self.pending.is_none() && self.pending_delete.is_none() {
+        if !dropped.is_empty()
+            && self.pending.is_none()
+            && self.pending_delete.is_none()
+            && self.upload_dialog.is_none()
+        {
             self.handle_drop(ctx, dropped);
         }
 
@@ -2068,28 +2371,46 @@ impl eframe::App for App {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let msg_w = (ui.available_width() - 240.0).max(50.0);
+                    let msg_w = (ui.available_width() - 272.0).max(50.0);
                     trunc_label(ui, &self.msg, msg_w);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // Far right: the About (info) button.
+                        if info_button(ui).clicked() {
+                            self.show_about = true;
+                        }
                         if github_button(ui).clicked() {
                             let _ = open::that(GITHUB_URL);
                         }
-                        ui.label(
-                            RichText::new(format!(
-                                "Vollded folder: {}",
-                                fmt_bytes(self.total_bytes)
-                            ))
-                            .size(12.0)
-                            .color(MUTED),
-                        );
+                        // Clickable: opens the Vollded folder in Explorer.
+                        let txt = format!("Folder size: {}", fmt_bytes(self.total_bytes));
+                        if link_text(ui, &txt, 12.0)
+                            .on_hover_text("Open the Vollded folder")
+                            .clicked()
+                        {
+                            match &self.root {
+                                Some(r) => {
+                                    if let Err(e) = open::that(r) {
+                                        self.msg = format!("Could not open the folder: {e}");
+                                    }
+                                }
+                                None => self.msg = "Pick your Vollded folder first.".into(),
+                            }
+                        }
                     });
                 });
             });
 
+        // The top bar may have just changed the items (Rescan / Browse). Refresh the cached list
+        // NOW, before the list is drawn: otherwise it would use out-of-date indices (pointing at
+        // folders that no longer exist) and the program would crash.
+        if self.view_dirty {
+            self.rebuild_view();
+        }
+
         // `.show()` returns the area it used; we remember it so we know where drops land.
         // The panel can't be narrower than `side_min_w`: right before the size label would disappear.
         self.list_rect = egui::SidePanel::left("list")
-            .default_width(self.side_min_w.max(320.0))
+            .default_width(self.side_min_w)
             .width_range(self.side_min_w..=440.0)
             .frame(egui::Frame::none().fill(PANEL).inner_margin(10.0))
             .show(ctx, |ui| self.list_ui(ui))
@@ -2120,11 +2441,18 @@ impl eframe::App for App {
         if self.pending_delete.is_some() {
             self.delete_confirm_ui(ctx);
         }
+        if self.upload_dialog.is_some() {
+            self.upload_dialog_ui(ctx);
+        }
+        if self.show_about {
+            self.about_ui(ctx);
+        }
 
         // 6) While files are being dragged over the window, show where they can be dropped.
         if ctx.input(|i| !i.raw.hovered_files.is_empty())
             && self.pending.is_none()
             && self.pending_delete.is_none()
+            && self.upload_dialog.is_none()
         {
             let p = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
@@ -2152,11 +2480,20 @@ impl eframe::App for App {
 
 /// Program entry point.
 fn main() -> eframe::Result<()> {
+    // If the app ever panics, write the reason next to the exe (no console window to read it from).
+    std::panic::set_hook(Box::new(|info| {
+        let _ = fs::write(exe_dir().join("vollded_ugc_crash.log"), format!("{info}\n"));
+    }));
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([980.0, 600.0])
+        .with_min_inner_size([980.0, 600.0])
+        .with_title("Vollded UGC");
+    // Window + taskbar icon (baked into the exe from assets/icon.png).
+    if let Some(icon) = load_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([980.0, 600.0])
-            .with_title("Vollded UGC"),
+        viewport,
         // Windowed apps are composed by the OS, so there is no visible tearing; turning vsync
         // off stops the graphics driver from busy-waiting. The frame limiter paces frames instead.
         vsync: false,

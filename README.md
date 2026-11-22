@@ -42,6 +42,12 @@ Files dropped on the window are **copied**, the originals are left untouched.
 - Status per UGC (To do, Modeling, Texturing, Ready, Uploaded) with a drop-down filter and search.
 - Checklist and progress bar per UGC: Reference image, Model, Texture, Ready, Description (only counted if the `.txt` has text).
 - Rename with a 50 character limit: the outline turns red while too long and green once valid.
-- Editable description (saved back to the `.txt`) and private notes.
-- Folder size on every list card and the total Vollded folder size in the bottom bar.
+- Editable description (saved back to the `.txt`, max 1000 characters) and private notes.
+- Folder size on every list card and the total Vollded folder size in the bottom bar ("Folder size", clickable, opens the folder).
+- Setting a UGC to Uploaded requires the link to the published UGC; a button next to Open folder opens it.
 - Previews and Textures titles open their folders, every file has its own Open button.
+- UGC cards can be dragged to reorder; folders and the files inside are renamed to match the new order (e.g. `2` becomes `1`).
+- Delete button on every card moves the whole UGC folder to the Recycle Bin after a confirmation.
+- Nothing is ever deleted permanently: replaced files and deleted UGCs all go to the Recycle Bin.
+- About pop-up (info button, bottom right) with author, version and the list of components used.
+- A crash log (`vollded_ugc_crash.log`) is written next to the exe if the app ever panics.
