@@ -200,9 +200,10 @@ struct Item {
     title: String,
     title_lc: String, // lower-case title, cached so searching doesn't re-lowercase every frame
     description: String,
-    desc_saved: bool,   // true if the .txt on disk has real text in it
-    dirty: bool,        // true if the description was edited but not saved yet
-    size_bytes: u64,    // total size of the whole folder
+    desc_orig: String, // the description as saved on disk (what "Discard changes" restores)
+    desc_saved: bool,  // true if the .txt on disk has real text in it
+    dirty: bool,       // true if the description was edited but not saved yet
+    size_bytes: u64,   // total size of the whole folder
     size_label: String, // the same, as text like "86.2 MB"
     /// File sizes are read once while scanning, never per frame.
     sizes: HashMap<PathBuf, String>,
@@ -278,6 +279,7 @@ impl Item {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
             it.description = fs::read_to_string(t).unwrap_or_default();
+            it.desc_orig = it.description.clone();
             it.desc_saved = !it.description.trim().is_empty();
         } else {
             it.title = format!("UGC #{}", it.id);
@@ -1587,9 +1589,7 @@ impl App {
                 };
                 let p = ui.painter_at(rect); // a painter clipped to this card
                 p.rect_filled(rect, 10.0, fill);
-                if sel {
-                    p.rect_stroke(rect, 10.0, Stroke::new(1.5, ACCENT));
-                }
+                // No outline on the selected card: its tinted background is enough.
 
                 // Number badge on the left.
                 let badge = Rect::from_min_size(rect.min + Vec2::new(10.0, 12.0), Vec2::splat(46.0));
@@ -1816,6 +1816,7 @@ impl App {
                     Ok(_) => {
                         item.dirty = false;
                         item.desc_saved = !item.description.trim().is_empty();
+                        item.desc_orig = item.description.clone();
                         self.view_dirty = true;
                         self.msg = "Description saved.".into();
                     }
@@ -2031,6 +2032,19 @@ fn github_button(ui: &mut egui::Ui) -> egui::Response {
         .on_hover_text("Open the Vollded page on GitHub")
 }
 
+/// Green (valid) / red (invalid) outline around an input box. The clip area is made a little
+/// wider than the card so the left and right edges are not cut off.
+fn validity_outline(ui: &egui::Ui, rect: Rect, ok: bool) {
+    let mut clip = ui.clip_rect();
+    clip.min.x -= 8.0;
+    clip.max.x += 8.0;
+    ui.painter().with_clip_rect(clip).rect_stroke(
+        rect.expand(2.0),
+        6.0,
+        Stroke::new(2.0, if ok { GOOD } else { ERR }),
+    );
+}
+
 /// Small round "i" button (drawn with the painter, no icon font needed).
 fn info_button(ui: &mut egui::Ui) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
@@ -2138,11 +2152,18 @@ fn left_col(
         if item.txt.is_none() {
             empty_hint(ui, "No .txt yet. Use Rename (or drop a .txt) to create it.");
         } else {
-            let r = ui.add(
-                egui::TextEdit::multiline(&mut item.description)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(7),
-            );
+            // The text box normally draws its own red focus ring (our theme's selection stroke).
+            // Turn that off inside this scope so only our green/red validity outline shows.
+            let r = ui
+                .scope(|ui| {
+                    ui.visuals_mut().selection.stroke = Stroke::NONE;
+                    ui.add(
+                        egui::TextEdit::multiline(&mut item.description)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(7),
+                    )
+                })
+                .inner;
             if r.changed() {
                 item.dirty = true;
             }
@@ -2150,11 +2171,7 @@ fn left_col(
             let over = count > MAX_DESC;
             // Outline: red when too long, green while editing a valid text (hidden otherwise).
             if over || item.dirty || r.has_focus() {
-                ui.painter().rect_stroke(
-                    r.rect.expand(2.0),
-                    6.0,
-                    Stroke::new(2.0, if over { ERR } else { GOOD }),
-                );
+                validity_outline(ui, r.rect, !over);
             }
             ui.horizontal_wrapped(|ui| {
                 let can_save = item.dirty && !over;
@@ -2165,6 +2182,11 @@ fn left_col(
                 });
                 if ui.add_enabled(can_save, b).clicked() {
                     act.save_desc = true;
+                }
+                // Throw the edits away and go back to the text saved on disk.
+                if item.dirty && ui.button("Discard changes").clicked() {
+                    item.description = item.desc_orig.clone();
+                    item.dirty = false;
                 }
                 let col = if over {
                     ERR

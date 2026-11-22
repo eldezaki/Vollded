@@ -49,5 +49,5 @@ Files dropped on the window are **copied**, the originals are left untouched.
 - UGC cards can be dragged to reorder; folders and the files inside are renamed to match the new order (e.g. `2` becomes `1`).
 - Delete button on every card moves the whole UGC folder to the Recycle Bin after a confirmation.
 - Nothing is ever deleted permanently: replaced files and deleted UGCs all go to the Recycle Bin.
-- About pop-up (info button, bottom right) with author, version and the list of components used.
+- About pop-up (info button, bottom right) with version and the list of components used.
 - A crash log (`vollded_ugc_crash.log`) is written next to the exe if the app ever panics.

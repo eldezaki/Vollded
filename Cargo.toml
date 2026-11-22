@@ -1,6 +1,6 @@
 [package]
 name = "vollded-ugc"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 description = "Portable local file manager for Vollded's Roblox UGC projects by eldezaki"
 
