@@ -2,9 +2,6 @@
 
 My own personal portable, Rust-only (egui) manager for Vollded's Roblox UGC project folders.
 
-    cargo build --release
-    # -> target/release/vollded-ugc.exe  (single file, no installer)
-
 ## Portable
 - One self-contained exe.
 - Settings are stored in `vollded_ugc.json` **next to the exe**.
@@ -22,3 +19,29 @@ My own personal portable, Rust-only (egui) manager for Vollded's Roblox UGC proj
 | `*.jpeg/jpg/png` | Reference image |
 | `*.spp` (non-autosave) | Texture (Substance Painter project) |
 | `*.txt` | file name = UGC name (max 50 chars, editable via Rename), content = description |
+
+## Drag & drop
+Files dropped on the window are **copied**, the originals are left untouched.
+
+| Dropped on | Result |
+|---|---|
+| the **left list** | creates the next numbered folder (e.g. `4`) and files the dropped items into it |
+| the **UGC view** | adds the files to the selected UGC, with a confirmation pop-up before anything is replaced |
+
+| Extension | Stored as |
+|---|---|
+| `.blend` | Model (`<id>.blend`), never the Ready file |
+| `.spp` | Texture (`<id>.spp`) |
+| `.jpg` / `.jpeg` | Reference image |
+| `.txt` | Description (the file name becomes the UGC name) |
+| `.mp4` | `previews/` |
+| `.png` | `textures/` |
+| anything else | rejected |
+
+## Features
+- Status per UGC (To do, Modeling, Texturing, Ready, Uploaded) with a drop-down filter and search.
+- Checklist and progress bar per UGC: Reference image, Model, Texture, Ready, Description (only counted if the `.txt` has text).
+- Rename with a 50 character limit: the outline turns red while too long and green once valid.
+- Editable description (saved back to the `.txt`) and private notes.
+- Folder size on every list card and the total Vollded folder size in the bottom bar.
+- Previews and Textures titles open their folders, every file has its own Open button.

@@ -10,6 +10,8 @@ eframe = { version = "0.29", default-features = false, features = ["default_font
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rfd = "0.15"
 open = "5"
+# Moves files/folders to the Recycle Bin (nothing is ever deleted permanently).
+trash = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
